@@ -190,37 +190,85 @@ class RadarSpoke:
             self.u02,
             self.u03) + pack_data(self.data).tobytes()
 
-    def send_radar_image(image):
+class RadarImage(object):
     """Convert an image array (2048x1024) to radar spoke packets and send via UDP."""
-    for spoke_idx in range(0, NAVICO_SPOKES, 32):
-        packet = struct.pack("<BBBBBBBB", 0,0,0,0,0,0,0,0)
-        for spoke_idx2 in range(spoke_idx, spoke_idx+32):
-            angle_raw = spoke_idx2 * 2  # Reverse the MOD_SPOKES(angle_raw / 2) calculation
-            heading_raw = 0  # Assuming a fixed heading for now
-            range_meters = 1000  # Example fixed range
-            time_rec = int(time.time())
 
-            # Extract the spoke data from the image
-            spoke_data = image[spoke_idx2, :].astype(np.uint8)
+    header = struct.pack("<BBBBBBBB", 0,0,0,0,0,0,0,0)
+    
+    def __init__(self, image):
+        self.image = image
+        self.spoke_idx = 0
+
+    def send(self, sock):
+        packet = self.header
+        for spoke_idx2 in range(self.spoke_idx, self.spoke_idx+32):
+            angle_raw = spoke_idx2 * 2  # Reverse the MOD_SPOKES(angle_raw / 2) calculation
+            heading_raw = 0
+            range_meters = 1000
+            spoke_data = self.image[spoke_idx2, :].astype(np.uint8)
 
             # Create and send a radar spoke packet
             packet += RadarSpoke(0x02, spoke_idx2, 0, angle_raw, heading_raw, range_meters, data=spoke_data).to_bytes()
+            
         sock.sendto(packet, (DATA_IP, DATA_PORT))
-        time.sleep(0.1)
+        self.spoke_idx = (self.spoke_idx + 32) % NAVICO_SPOKES
 
+class Timers(object):
+    def __init__(self):
+        self.timers = []
+        for name in dir(self):
+            fn = getattr(self, name, None)
+            if hasattr(fn, "__often__"):
+                self.timers.append([fn, fn.__often__, 0])
+
+    @classmethod
+    def timer(cls, often):
+        def timer(fn):
+            fn.__often__ = often
+            return fn
+        return timer
+
+    def run(self):
+        while True:
+            now = time.time()
+            nxt = now + 10
+            for idx in range(len(self.timers)):
+                fn, often, when = self.timers[idx]
+                if now > when:
+                    print("Running %s..." % (fn.__name__,))
+                    fn()
+                    self.timers[idx][2] = now + often
+                if self.timers[idx][2] < nxt:
+                    nxt = self.timers[idx][2]
+            now = time.time()
+            sleeptime = nxt - now
+            if sleeptime > 0: time.sleep(sleeptime)
+
+class Sender(Timers):
+    def __init__(self):
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+        self.sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 2)
+        self.sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF, socket.inet_aton(RADAR_IP))
+        self.sock.bind((RADAR_IP, 0))
+        self.image = RadarImage(test_image)
+        Timers.__init__(self)
+ 
+    @Timers.timer(0.1)
+    def send_status_report(self):
+        self.sock.sendto(status_report_bytes, (MULTICAST_IP, PORT))
+
+    @Timers.timer(0.1)
+    def send_radar_settings(self):
+        self.sock.sendto(radar_settings_bytes, (MULTICAST_IP, PORT))
+
+    @Timers.timer(0.1)
+    def send_radar_report_01B2(self):
+        self.sock.sendto(radar_report_01B2_bytes, (MULTICAST_IP, PORT))
+
+    @Timers.timer(0.015)
+    def send_image(self):
+        self.image.send(self.sock)
+    
+        
 if __name__ == "__main__":
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
-    sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 2)
-    sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF, socket.inet_aton(RADAR_IP))
-    sock.bind((RADAR_IP, 0))
-
-
-    while True:
-        sock.sendto(status_report_bytes, (MULTICAST_IP, PORT))
-        sock.sendto(radar_settings_bytes, (MULTICAST_IP, PORT))
-        sock.sendto(radar_report_01B2_bytes, (MULTICAST_IP, PORT))
-        print(f"Sent status")
-        send_radar_image(test_image)
-        print(f"Sent image")
-        time.sleep(0.1)
-
+    Sender().run()
